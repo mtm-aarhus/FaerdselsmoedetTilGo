@@ -1,15 +1,3 @@
-"""robot_framework/faerdselsmoede_pdf.py - læser et møde fra Færdselsmødets database og
-laver dagsorden/referat som PDF.
-
-PDF-koden er en kopi af _build_agenda_pdf / _build_referat_pdf / _letterhead_story i
-web-appens app/blueprints/meetings/routes.py. Ændres layoutet i web-appen, skal det
-også ændres her - ellers ser dokumentet i GO anderledes ud end det deltagerne fik.
-
-Databasen angives som enten
-    - en sti til en SQLite-fil (midlertidigt: en kopi af web-appens faerdselsmoede_dev.db), eller
-    - en SQLAlchemy-URL (senere: mssql+pyodbc://... til produktionsdatabasen).
-Databasen åbnes altid skrivebeskyttet - robotten ændrer intet i den.
-"""
 import io
 import os
 from datetime import datetime, timedelta

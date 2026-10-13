@@ -14,7 +14,7 @@ import faerdselsmoede_pdf
 # Navne på Constants/Credentials i OpenOrchestrator (ret her, hvis de hedder andet)
 # ---------------------------------------------------------------------------
 CONST_GO_API_URL = "GOApiURL"                       # samme constant som i Personalemappe-robotten
-CRED_GO_API_USER = "GOAktApiUser"                   # GO API-bruger (username/password)
+CRED_GO_API_USER = "GOAdminUser"                   # GO API-bruger (username/password)
 CONST_DATABASE = "FaerdselsmoedetDatabase"          # sti til SQLite-kopi ELLER SQLAlchemy-URL
 DATABASE_STANDARD = "faerdselsmoede_dev.db"         # bruges hvis constanten ikke findes
 
@@ -121,21 +121,7 @@ def _hent_database_constant(orchestrator_connection: OrchestratorConnection) -> 
 
 def overfoer_til_go(orchestrator_connection: OrchestratorConnection, go_api_url: str, go_username: str,
                     go_password: str, go_case_number: str | None, titel: str, indhold: bytes) -> int:
-    """Uploader ét dokument til GO-sagen via /_goapi/Documents/AddToCase
-    (samme metode som Personalemappe-robotten).
-
-    Metadata svarer til de eksisterende færdselsmødedokumenter i GO:
-        Titel          = "Færdselsmøde nr. 1302 - referat"
-        Dato           = overførselsdagen (dd-mm-åååå)
-        Korrespondance = "Udgående"
-    Parter og dokumentansvarlig sættes ikke (endnu).
-
-    Idempotens: filnavnet er fast pr. møde og dokumenttype, og "Overwrite" er True,
-    så en genkørsel (fx manuel overførsel efter en rettelse) overskriver dokumentet
-    i stedet for at lave en dublet.
-
-    Returnerer GO's DocId.
-    """
+    
     sagsnummer = (go_case_number or GO_SAGSNUMMER_STANDARD).strip().upper()
     filnavn = _sikkert_filnavn(f"{titel}.pdf")
 
@@ -174,8 +160,6 @@ def overfoer_til_go(orchestrator_connection: OrchestratorConnection, go_api_url:
 
 
 def _go_post_med_retries(session: requests.Session, url: str, payload: dict, sagsnummer: str) -> requests.Response:
-    """POST til GO med retry ved forbindelsesfejl, timeout og 5xx.
-    4xx er permanent (fx sagen findes ikke eller brugeren mangler adgang) -> BusinessError."""
     sidste_fejl = None
     for forsoeg in range(1, HTTP_FORSOEG + 1):
         try:
