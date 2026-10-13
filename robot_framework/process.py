@@ -16,7 +16,7 @@ import faerdselsmoede_pdf
 CONST_GO_API_URL = "GOApiURL"                       # samme constant som i Personalemappe-robotten
 CRED_GO_API_USER = "GOAdminUser"                   # GO API-bruger (username/password)
 CONST_DATABASE = "FaerdselsmoedetDatabase"          # sti til SQLite-kopi ELLER SQLAlchemy-URL
-DATABASE_STANDARD = "faerdselsmoede_dev.db"         # bruges hvis constanten ikke findes
+DATABASE_STANDARD = r"D:\Faerdselsmoedet_db\faerdselsmoede_dev.db"       # bruges hvis constanten ikke findes
 
 # GO-sagen alle færdselsmødedokumenter lægges på, når køelementet ikke angiver en anden.
 GO_SAGSNUMMER_STANDARD = "GEO-2024-199848"
