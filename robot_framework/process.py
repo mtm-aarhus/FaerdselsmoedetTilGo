@@ -15,7 +15,7 @@ import faerdselsmoede_pdf   # ligger i samme mappe som main.py
 # Navne på Constants/Credentials i OpenOrchestrator (ret her, hvis de hedder andet)
 # ---------------------------------------------------------------------------
 CONST_GO_API_URL = "GOApiURL"                       # samme constant som i Personalemappe-robotten
-CRED_GO_API_USER = "GOAktApiUser"                   # GO API-bruger (username/password)
+CRED_GO_API_USER = "GOAdminUser"                   # GO API-bruger (username/password)
 CONST_DATABASE = "FaerdselsmoedetDatabase"          # sti til SQLite-kopi ELLER SQLAlchemy-URL
 DATABASE_STANDARD = "faerdselsmoede_dev.db"         # bruges hvis constanten ikke findes
 
