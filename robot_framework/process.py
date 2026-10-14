@@ -1,3 +1,4 @@
+
 import json
 import time
 from datetime import datetime
@@ -8,15 +9,15 @@ from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConn
 from OpenOrchestrator.database.queues import QueueElement
 
 from robot_framework.exceptions import BusinessError
-import faerdselsmoede_pdf
+import faerdselsmoede_pdf   # ligger i samme mappe som main.py
 
 # ---------------------------------------------------------------------------
 # Navne på Constants/Credentials i OpenOrchestrator (ret her, hvis de hedder andet)
 # ---------------------------------------------------------------------------
 CONST_GO_API_URL = "GOApiURL"                       # samme constant som i Personalemappe-robotten
-CRED_GO_API_USER = "GOAdminUser"                   # GO API-bruger (username/password)
+CRED_GO_API_USER = "GOAktApiUser"                   # GO API-bruger (username/password)
 CONST_DATABASE = "FaerdselsmoedetDatabase"          # sti til SQLite-kopi ELLER SQLAlchemy-URL
-DATABASE_STANDARD = r"D:\Faerdselsmoedet_db\faerdselsmoede_dev.db"       # bruges hvis constanten ikke findes
+DATABASE_STANDARD = "faerdselsmoede_dev.db"         # bruges hvis constanten ikke findes
 
 # GO-sagen alle færdselsmødedokumenter lægges på, når køelementet ikke angiver en anden.
 GO_SAGSNUMMER_STANDARD = "GEO-2024-199848"
@@ -66,21 +67,30 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     else:
         pdf = faerdselsmoede_pdf.build_referat_pdf(moede, indstillinger)
 
-    # Titel som de eksisterende dokumenter i GO: "Færdselsmøde nr. 1302 - referat"
+    # Titel som de eksisterende dokumenter i GO: "Færdselsmøde nr. 1302 - referat".
+    # En rettelse (manuel overførsel) bliver et NYT dokument, fordi det første er
+    # journaliseret i GO og ikke skal overskrives.
     titel = f"Færdselsmøde nr. {moede.meeting_number} - {document_type}"
+    if payload.get("rettelse"):
+        titel += f" (rettet {datetime.now().strftime('%d-%m-%Y %H.%M')})"
     log(f"PDF lavet: {titel} ({len(pdf) / 1024:.0f} KB)")
 
-    # 5. Overfør til GO ------------------------------------------------------
+    # 5. Overfør til GO og journaliser --------------------------------------
+    session = requests.Session()
+    session.auth = HttpNtlmAuth(go_api_login.username, go_api_login.password)
+
     doc_id = overfoer_til_go(
         orchestrator_connection=orchestrator_connection,
+        session=session,
         go_api_url=go_api_url,
-        go_username=go_api_login.username,
-        go_password=go_api_login.password,
         go_case_number=go_case_number,
         titel=titel,
         indhold=pdf,
     )
     log(f"Overført {titel} til GO (DocId {doc_id})")
+
+    journaliser_dokument(go_api_url, doc_id, session)
+    log(f"Journaliseret DocId {doc_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +119,7 @@ def _parse_queue_element(queue_element: QueueElement | None) -> dict:
 def _hent_database_constant(orchestrator_connection: OrchestratorConnection) -> str:
     """Databasen fra Constant; findes den ikke, bruges SQLite-kopien i robottens mappe."""
     try:
-        return orchestrator_connection.get_constant(CONST_DATABASE).value
+        return orchestrator_connection.get_constant(CONST_DATABASE).value.strip().strip('"').strip("'")
     except ValueError:
         orchestrator_connection.log_info(f"Constant '{CONST_DATABASE}' findes ikke - bruger {DATABASE_STANDARD}")
         return DATABASE_STANDARD
@@ -119,9 +129,9 @@ def _hent_database_constant(orchestrator_connection: OrchestratorConnection) -> 
 # GO
 # ---------------------------------------------------------------------------
 
-def overfoer_til_go(orchestrator_connection: OrchestratorConnection, go_api_url: str, go_username: str,
-                    go_password: str, go_case_number: str | None, titel: str, indhold: bytes) -> int:
-    
+def overfoer_til_go(orchestrator_connection: OrchestratorConnection, session: requests.Session, go_api_url: str,
+                    go_case_number: str | None, titel: str, indhold: bytes) -> int:
+
     sagsnummer = (go_case_number or GO_SAGSNUMMER_STANDARD).strip().upper()
     filnavn = _sikkert_filnavn(f"{titel}.pdf")
 
@@ -147,25 +157,31 @@ def overfoer_til_go(orchestrator_connection: OrchestratorConnection, go_api_url:
         "Overwrite": True,
     }
 
-    session = requests.Session()
-    session.auth = HttpNtlmAuth(go_username, go_password)
     url = f"{go_api_url.rstrip('/')}/_goapi/Documents/AddToCase"
 
     orchestrator_connection.log_info(f"Uploader {filnavn} til GO-sag {sagsnummer}")
-    resp = _go_post_med_retries(session, url, payload, sagsnummer)
+    resp = _go_post_med_retries(session, url, sagsnummer, data=payload)
     svar = resp.json()
     if "DocId" not in svar:
         raise RuntimeError(f"GO svarede uden DocId for {filnavn}: {str(svar)[:300]}")
     return svar["DocId"]
 
 
-def _go_post_med_retries(session: requests.Session, url: str, payload: dict, sagsnummer: str) -> requests.Response:
+def journaliser_dokument(go_api_url: str, doc_id: int, session: requests.Session) -> None:
+    """Journaliserer dokumentet (markerer det som sagsakt) - samme kald som Aktbob-robotten."""
+    url = f"{go_api_url.rstrip('/')}/_goapi/Documents/MarkMultipleAsCaseRecord/ByDocumentId"
+    _go_post_med_retries(session, url, f"DocId {doc_id}", json={"DocumentIds": [doc_id]})
+
+
+def _go_post_med_retries(session: requests.Session, url: str, hvad: str, **kwargs) -> requests.Response:
+    """POST til GO med retry ved forbindelsesfejl, timeout og 5xx.
+    4xx er permanent (fx sagen findes ikke eller brugeren mangler adgang) -> BusinessError."""
     sidste_fejl = None
     for forsoeg in range(1, HTTP_FORSOEG + 1):
         try:
-            resp = session.post(url, data=payload, timeout=600)
+            resp = session.post(url, timeout=600, **kwargs)
             if 400 <= resp.status_code < 500:
-                raise BusinessError(f"GO afviste uploadet til sag {sagsnummer} (HTTP {resp.status_code}): {resp.text[:300]}")
+                raise BusinessError(f"GO afviste kaldet for {hvad} (HTTP {resp.status_code}): {resp.text[:300]}")
             if resp.status_code < 400:
                 return resp
             sidste_fejl = RuntimeError(f"HTTP {resp.status_code} fra GO: {resp.text[:300]}")
