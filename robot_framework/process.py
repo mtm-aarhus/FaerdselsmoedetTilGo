@@ -1,4 +1,4 @@
-
+f
 import json
 import time
 from datetime import datetime
@@ -160,7 +160,7 @@ def overfoer_til_go(orchestrator_connection: OrchestratorConnection, session: re
     url = f"{go_api_url.rstrip('/')}/_goapi/Documents/AddToCase"
 
     orchestrator_connection.log_info(f"Uploader {filnavn} til GO-sag {sagsnummer}")
-    resp = _go_post_med_retries(session, url, sagsnummer, data=payload)
+    resp = _go_post_med_retries(session, url, sagsnummer, json=payload)
     svar = resp.json()
     if "DocId" not in svar:
         raise RuntimeError(f"GO svarede uden DocId for {filnavn}: {str(svar)[:300]}")
