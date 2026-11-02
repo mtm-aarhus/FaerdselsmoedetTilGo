@@ -22,7 +22,7 @@ dependencies = [
     "requests-ntlm == 1.*",
     "reportlab == 4.*",
     "SQLAlchemy == 2.*",
-    # "pyodbc == 5.*",   # tilføjes når robotten skal læse fra SQL Server i stedet for SQLite-kopien
+     "pyodbc == 5.*", 
 ]
 
 [project.optional-dependencies]
