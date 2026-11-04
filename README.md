@@ -1,62 +1,53 @@
-# Robot-Framework V4
+# FaerdselsmoedetTilGo
 
-This repo is meant to be used as a template for robots made for [OpenOrchestrator](https://github.com/itk-dev-rpa/OpenOrchestrator) v2.
+OpenOrchestrator-robot (kø: `FaerdselsmoedetGoOverfoersel`), der lægger dokumenter fra
+Færdselsmødet på GetOrganized. Bygget på ITK's Robot-Framework (queue framework).
 
-## Quick start
+Web-appen lægger to køelementer i køen, når referenten trykker **Afslut referat**:
 
-1. To use this template simply use this repo as a template (see [Creating a repository from a template](https://docs.github.com/en/repositories/creating-and-managing-repositories/creating-a-repository-from-a-template)).
-__Don't__ include all branches.
+- **dagsorden** – én PDF
+- **referat** – én ZIP med referatet (PDF) og bilagene, én mappe pr. dagsordenspunkt
 
-2. Go to `robot_framework/__main__.py` and choose between the linear framework or queue based framework.
+## Køelementet
 
-3. Implement all functions in the files:
-    * `robot_framework/initialize.py`
-    * `robot_framework/reset.py`
-    * `robot_framework/process.py`
+```json
+{
+  "meeting_id": "8f3c…",
+  "meeting_number": 1302,
+  "document_type": "referat",
+  "go_case_number": "GEO-2024-199848",
+  "rettelse": false
+}
+```
 
-4. Change `config.py` to your needs.
+Kun `meeting_id` og `document_type` er påkrævet. Web-appen angiver GO-sagen
+(`GO_CASE_NUMBER_DAGSORDEN` / `GO_CASE_NUMBER_REFERAT`). `rettelse` er `true`, når mødet
+er sendt til GO før, og så får dokumentet "(rettet …)" i titlen.
 
-5. Fill out the dependencies in the `pyproject.toml` file with all packages needed by the robot.
+## Opsætning i OpenOrchestrator
 
-6. Feel free to add more files as needed. Remember that any additional python files must
-be located in the folder `robot_framework` or a subfolder of it.
+| Type | Navn | Indhold |
+|---|---|---|
+| Constant | `GOApiURL` | GO's API-URL |
+| Credential | `GOAdminUser` | GO API-bruger (username/password) |
+| Constant | `FaerdselsmoedetDatabase` | Sti til SQLite-kopi eller SQLAlchemy-URL. Standard: `faerdselsmoede_dev.db` |
+| Credential | `FaerdselsmoedetAPI` | **Username:** web-appens API-URL, fx `http://localhost:5000/api/v1`. **Password:** API-nøglen |
 
-When the robot is run from OpenOrchestrator the `main.py` file is run which results
-in the following:
+API-nøglen skal være den samme som miljøvariablen `FAERDSELSMOEDE_API_KEY` på web-serveren.
 
-1. The working directory is changed to where `main.py` is located.
-2. A virtual environment is automatically setup with the required packages.
-3. The framework is called passing on all arguments needed by [OpenOrchestrator](https://github.com/itk-dev-rpa/OpenOrchestrator).
+## Bilag
 
-## Requirements
+Bilagene ligger på web-serverens lokale drev (`UPLOAD_FOLDER`). Robotten henter dem via
+web-appens fil-API (`robot_framework/faerdselsmoede_api.py`, dokumentation i web-appens
+`docs/API.md`):
 
-Minimum python version 3.11
+1. `GET /status` – tjekker nøgle og URL.
+2. `GET /moeder/{meeting_id}/bilag` – mødets bilag pr. dagsordenspunkt.
+3. `GET /bilag/{id}` – hver fil. SHA-256 tjekkes, så en afbrudt overførsel opdages.
 
-## Flow
+Fejl:
 
-This framework contains two different flows: A linear and a queue based.
-You should only ever use one at a time. You choose which one by going into `robot_framework/__main__.py`
-and uncommenting the framework you want. They are both disabled by default and an error will be
-raised to remind you if you don't choose.
+- Mangler et bilag på web-serveren → **BusinessError**: der lægges aldrig en ufuldstændig ZIP på GO.
+- Forkert nøgle/URL, eller web-appen er nede → almindelig fejl: robotten prøver igen og sender fejlmail.
 
-### Linear Flow
-
-The linear framework is used when a robot is just going from A to Z without fetching jobs from an
-OpenOrchestrator queue.
-The flow of the linear framework is sketched up in the following illustration:
-
-![Linear Flow diagram](Robot-Framework.svg)
-
-### Queue Flow
-
-The queue framework is used when the robot is doing multiple bite-sized tasks defined in an
-OpenOrchestrator queue.
-The flow of the queue framework is sketched up in the following illustration:
-
-![Queue Flow diagram](Robot-Queue-Framework.svg)
-
-## Linting and Github Actions
-
-This template is also setup with flake8 and pylint linting in Github Actions.
-This workflow will trigger whenever you push your code to Github.
-The workflow is defined under `.github/workflows/Linting.yml`.
+Dagsordenen har ingen bilag og bruger ikke API'et.

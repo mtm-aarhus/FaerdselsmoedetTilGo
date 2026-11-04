@@ -1,3 +1,15 @@
+"""faerdselsmoede_pdf.py (ligger i samme mappe som main.py) - læser et møde fra Færdselsmødets database og
+laver dagsorden/referat som PDF.
+
+PDF-koden er en kopi af _build_agenda_pdf / _build_referat_pdf / _letterhead_story i
+web-appens app/blueprints/meetings/routes.py. Ændres layoutet i web-appen, skal det
+også ændres her - ellers ser dokumentet i GO anderledes ud end det deltagerne fik.
+
+Databasen angives som enten
+    - en sti til en SQLite-fil (midlertidigt: en kopi af web-appens faerdselsmoede_dev.db), eller
+    - en SQLAlchemy-URL (senere: mssql+pyodbc://... til produktionsdatabasen).
+Databasen åbnes altid skrivebeskyttet - robotten ændrer intet i den.
+"""
 import io
 import os
 from datetime import datetime, timedelta
@@ -34,8 +46,8 @@ def opret_engine(database: str):
 
     sti = Path(database)
     if not sti.is_absolute():
-        # Relativ sti = i forhold til robottens mappe (den med main.py)
-        sti = Path(__file__).resolve().parent.parent / sti
+        # Relativ sti = i forhold til robottens mappe (den med main.py og denne fil)
+        sti = Path(__file__).resolve().parent / sti
     if not sti.exists():
         raise FileNotFoundError(f"Databasefilen findes ikke: {sti}")
     # mode=ro: SQLite åbnes skrivebeskyttet, så kopien aldrig ændres ved en fejl
@@ -76,9 +88,9 @@ def hent_moede(engine, meeting_id: str):
         indstillinger = []
         for r in rows:
             bilag = conn.execute(text(
-                "SELECT original_filename FROM attachment WHERE proposal_id = :pid ORDER BY id"),
+                "SELECT filename, original_filename FROM attachment WHERE proposal_id = :pid ORDER BY id"),
                 {"pid": r["id"]}).mappings().all()
-            indstillinger.append(_indstilling(r, [b["original_filename"] for b in bilag]))
+            indstillinger.append(_indstilling(r, bilag))
 
     meeting_date = _dt(m["meeting_date"])
     slut = meeting_date + timedelta(minutes=m["duration_minutes"] or 120)
@@ -97,9 +109,10 @@ def hent_moede(engine, meeting_id: str):
     return moede, indstillinger
 
 
-def _indstilling(r, bilag_navne):
+def _indstilling(r, bilag):
     adresser = [a.strip() for a in (r["addresses"] or r["address"] or "").splitlines() if a.strip()]
     return SimpleNamespace(
+        id=r["id"],
         project_name=r["project_name"],
         address=r["address"],
         address_display=", ".join(adresser) or (r["address"] or ""),
@@ -114,8 +127,54 @@ def _indstilling(r, bilag_navne):
         outcome_status=r["outcome_status"],
         agenda_order=r["agenda_order"],
         submitted_at=_dt(r["submitted_at"]),
-        attachments=[SimpleNamespace(original_filename=n) for n in bilag_navne],
+        # filename = navnet i web-appens uploadmappe, original_filename = det brugeren uploadede
+        attachments=[SimpleNamespace(filename=b["filename"], original_filename=b["original_filename"]) for b in bilag],
     )
+
+
+# ---------------------------------------------------------------------------
+# Referat + bilag som ZIP (til GO)
+# ---------------------------------------------------------------------------
+
+def _sikkert_mappenavn(navn: str) -> str:
+    """Som web-appens _safe_name: fjerner tegn, der ikke må stå i mappe-/filnavne."""
+    return "".join("_" if c in '\\/:*?"<>|' else c for c in navn)[:80]
+
+
+def build_referat_zip(moede, indstillinger, bilag: dict) -> tuple[bytes, list[str]]:
+    """Referatet som PDF i roden + én mappe pr. dagsordenspunkt ("N. Titel") med dens bilag
+    (samme opbygning som politiets ZIP med dagsordenen i web-appen).
+
+    `bilag` er hentet fra web-appens fil-API: {proposal_id: [(filnavn, indhold), ...]}.
+    Returnerer (zip, ukendte), hvor `ukendte` er dagsordenspunkter, som web-appen har bilag
+    til, men som ikke findes i robottens database (kopien er ældre end mødet)."""
+    import zipfile
+
+    kendte = {p.id for p in indstillinger}
+    ukendte = [pid for pid, filer in bilag.items() if filer and pid not in kendte]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"Referat_FM_{moede.meeting_number}.pdf", build_referat_pdf(moede, indstillinger))
+        for idx, p in enumerate(indstillinger, start=1):
+            folder = _sikkert_mappenavn(f"{idx}. {p.project_name or p.address or 'Indstilling'}")
+            brugte = set()
+            for filnavn, indhold in bilag.get(p.id, []):
+                navn = _unikt_navn(_sikkert_mappenavn(filnavn or "bilag"), brugte)
+                zf.writestr(f"{folder}/{navn}", indhold)
+    return buf.getvalue(), ukendte
+
+
+def _unikt_navn(navn: str, brugte: set) -> str:
+    """To bilag med samme navn i samme mappe bliver til "navn.pdf" og "navn (2).pdf"."""
+    stamme, punktum, endelse = navn.rpartition(".")
+    if not punktum:
+        stamme, endelse = navn, ""
+    kandidat, n = navn, 2
+    while kandidat.lower() in brugte:
+        kandidat = f"{stamme} ({n})" + (f".{endelse}" if endelse else "")
+        n += 1
+    brugte.add(kandidat.lower())
+    return kandidat
 
 
 # ---------------------------------------------------------------------------
@@ -218,9 +277,9 @@ def build_agenda_pdf(meeting, proposals) -> bytes:
 
     for idx, p in enumerate(proposals, start=1):
         story.append(Spacer(1, 0.25*cm))
+        # The point's name (repræsentativ adresse / projektnavn) is the heading; no address list
         story.append(Paragraph(f'{idx}. {p.project_name or p.address or "(uden titel)"}', h2))
         rows = [
-            ['Adresse', p.address_display or '—'],
             ['Ansøger / Projektleder', p.applicant or p.meeting_attendee or '—'],
             ['Status', p.status_label],
         ]
@@ -300,7 +359,6 @@ def build_referat_pdf(meeting, proposals) -> bytes:
         story.append(Paragraph(f'{idx}. {p.project_name or p.address or "(uden titel)"}', h2_style))
 
         rows = [
-            ['Adresse', p.address or '—'],
             ['Ansøger / Projektleder', p.applicant or p.meeting_attendee or '—'],
             ['Status', p.status_label],
         ]
