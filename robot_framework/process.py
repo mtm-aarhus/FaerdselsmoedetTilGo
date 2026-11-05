@@ -49,7 +49,7 @@ from robot_framework.exceptions import BusinessError
 from robot_framework.faerdselsmoede_api import FaerdselsmoedeApi
 
 # ---------------------------------------------------------------------------
-# Navne på Constants/Credentials i OpenOrchestrator (ret her, hvis de hedder andet)
+# Navne på Constants/Credentials i OpenOrchestrator 
 # ---------------------------------------------------------------------------
 CONST_GO_API_URL = "GOApiURL"                       # samme constant som i Personalemappe-robotten
 CRED_GO_API_USER = "GOAdminUser"                    # GO API-bruger (username/password)
@@ -266,7 +266,7 @@ def _sikkert_filnavn(navn: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Stor upload (> 10 MB) - chunk-upload via SharePoint, som i Aktbob-robotten
+# Stor upload (> 10 MB) - 
 # ---------------------------------------------------------------------------
 
 def upload_stort_dokument(orchestrator_connection: OrchestratorConnection, session: requests.Session,
