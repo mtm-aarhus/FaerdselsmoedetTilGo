@@ -53,8 +53,6 @@ from robot_framework.faerdselsmoede_api import FaerdselsmoedeApi
 # ---------------------------------------------------------------------------
 CONST_GO_API_URL = "GOApiURL"                       # samme constant som i Personalemappe-robotten
 CRED_GO_API_USER = "GOAdminUser"                    # GO API-bruger (username/password)
-CONST_DATABASE = "FaerdselsmoedetDatabase"          # sti til SQLite-kopi ELLER SQLAlchemy-URL
-DATABASE_STANDARD = "faerdselsmoede_dev.db"         # bruges hvis constanten ikke findes
 CRED_FAERDSELSMOEDE_API = "FaerdselsmoedetAPI"      # web-appens fil-API: username = base-URL, password = nøgle
 
 # GO-sagen alle færdselsmødedokumenter lægges på, når køelementet ikke angiver en anden.
