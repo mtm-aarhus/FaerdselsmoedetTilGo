@@ -2,48 +2,43 @@
 
 Flow:
     1. Web-appen (Færdselsmødet) lægger to køelementer i OpenOrchestrator, når referenten
-       trykker "Afslut referat": ét for dagsordenen og ét for referatet. Fejlede det, kan
-       det sendes igen fra mødesiden.
+       trykker "Afslut referat": ét for dagsordenen og ét for referatet.
     2. Køelementet er kun en pointer (maks. 2000 tegn), fx:
         {
             "meeting_id": "8f3c...",
             "meeting_number": 1302,              # valgfri - kun til log/reference
             "document_type": "referat",          # eller "dagsorden"
-            "go_case_number": "GEO-2024-199848"  # valgfri - ellers GO_SAGSNUMMER_STANDARD
+            "go_case_number": "GEO-2024-199848", # valgfri - ellers GO_SAGSNUMMER_STANDARD
+            "rettelse": false                    # true = mødet er sendt til GO før
         }
-    3. Robotten læser mødet direkte fra Færdselsmødets database, henter bilagene fra
-       web-appens fil-API (kun referatet), laver dokumentet selv (faerdselsmoede_pdf.py)
-       og lægger det på GO-sagen med titlen
-       "Færdselsmøde nr. 1302 - referat", dagens dato og Korrespondance "Udgående":
+    3. Robotten henter det FÆRDIGE dokument fra sitets API (se faerdselsmoede_api.py):
          - dagsorden: én PDF
-         - referat:   én ZIP med referatet (PDF) og bilagene, én mappe pr. dagsordenspunkt.
-       Web-appen angiver sagen i køelementet (én sag til dagsordener, én til referater).
+         - referat:   én ZIP med referatet (PDF) og bilagene, én mappe pr. dagsordenspunkt
+       Sitet bygger dokumenterne selv - de er præcis dem, deltagerne fik. Robotten har
+       derfor ingen adgang til sitets database eller bilagsmappe.
+    4. Dokumentet lægges på GO-sagen med titlen "Færdselsmøde nr. 1302 - referat",
+       dagens dato og Korrespondance "Udgående", og journaliseres.
+         - Op til 10 MB: /_goapi/Documents/AddToCase
+         - Over 10 MB:   chunk-upload via SharePoint (samme metode som Aktbob-robotten)
 
-Bilag (Credential "FaerdselsmoedetAPI"):
-    Bilagene ligger på web-serverens lokale drev og hentes via /api/v1 (se docs/API.md i
-    web-appen og robot_framework/faerdselsmoede_api.py).
-        Username = API'ets base-URL, fx "http://localhost:5000/api/v1"
-        Password = API-nøglen (samme værdi som FAERDSELSMOEDE_API_KEY på web-serveren)
-    Mangler et bilag på web-serveren, fejler referatet som BusinessError - så der aldrig
-    lægges en ufuldstændig ZIP på sagen. Hver fil tjekkes med SHA-256 efter download.
-
-Database (Constant "FaerdselsmoedetDatabase"):
-    MIDLERTIDIGT: sti til en KOPI af web-appens SQLite-fil, fx "faerdselsmoede_dev.db" i
-    robottens mappe. Kopien opdateres ikke af sig selv - møder oprettet efter kopieringen
-    findes ikke, og fejler som BusinessError.
-    SENERE (produktion): en SQLAlchemy-URL til SQL Server, fx
-    "mssql+pyodbc://@SERVER/POFCBA?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes".
+Credentials/Constants i OpenOrchestrator:
+    FaerdselsmoedetAPI (credential): Username = API'ets base-URL, Password = API-nøglen
+    GOApiURL (constant), GOAdminUser (credential)
 
 Fejltyper:
-    BusinessError   -> permanent: kan aldrig lykkes (mødet findes ikke, ugyldig dokumenttype,
-                       GO afviser med 4xx). Markeres Failed, ingen retry.
-    Anden exception -> midlertidig eller opsætningsfejl (databasefil mangler, GO nede).
+    BusinessError   -> permanent: kan aldrig lykkes (mødet findes ikke, bilag mangler på sitet,
+                       ugyldig dokumenttype, GO afviser med 4xx). Markeres Failed, ingen retry.
+    Anden exception -> midlertidig eller opsætningsfejl (sitet/GO nede, forkert nøgle).
                        Frameworket prøver igen op til MAX_RETRY_COUNT og sender fejlmail.
 """
+import io
 import json
 import re
 import time
+import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime
+from urllib.parse import quote
 
 import requests
 from requests_ntlm import HttpNtlmAuth
@@ -52,7 +47,6 @@ from OpenOrchestrator.database.queues import QueueElement
 
 from robot_framework.exceptions import BusinessError
 from robot_framework.faerdselsmoede_api import FaerdselsmoedeApi
-import faerdselsmoede_pdf   # ligger i samme mappe som main.py
 
 # ---------------------------------------------------------------------------
 # Navne på Constants/Credentials i OpenOrchestrator (ret her, hvis de hedder andet)
@@ -65,7 +59,8 @@ CRED_FAERDSELSMOEDE_API = "FaerdselsmoedetAPI"      # web-appens fil-API: userna
 
 # GO-sagen alle færdselsmødedokumenter lægges på, når køelementet ikke angiver en anden.
 GO_SAGSNUMMER_STANDARD = "GEO-2024-199848"
-GO_MAKS_BYTES = 10 * 1024 * 1024   # AddToCase-grænse (større filer kræver chunk-upload)
+GO_MAKS_BYTES = 10 * 1024 * 1024   # AddToCase-grænse - større filer chunk-uploades
+CHUNK_BYTES = 10 * 1024 * 1024     # størrelse pr. chunk ved stor upload
 
 GYLDIGE_DOKUMENTTYPER = ("dagsorden", "referat")
 
@@ -75,7 +70,7 @@ HTTP_PAUSE_SEK = 20
 
 
 def process(orchestrator_connection: OrchestratorConnection, queue_element: QueueElement | None = None) -> None:
-    """Behandler ét køelement: læser mødet, laver dokumentet (PDF / ZIP) og overfører det til GO."""
+    """Behandler ét køelement: henter dokumentet fra sitet og overfører det til GO."""
     log = orchestrator_connection.log_info
     orchestrator_connection.log_trace("Running process.")
 
@@ -87,50 +82,27 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
 
     log(f"Behandler {document_type} for møde {payload.get('meeting_number') or meeting_id}")
 
-    # 2. Constants og credentials (samme måde som Personalemappe-robotten) ----
+    # 2. Constants og credentials ---------------------------------------------
     go_api_url = orchestrator_connection.get_constant(CONST_GO_API_URL).value
     go_api_login = orchestrator_connection.get_credential(CRED_GO_API_USER)
-    database = _hent_database_constant(orchestrator_connection)
+    api_login = orchestrator_connection.get_credential(CRED_FAERDSELSMOEDE_API)
     log("Constants og credentials hentet")
 
-    # 3. Læs mødet fra databasen ---------------------------------------------
-    engine = faerdselsmoede_pdf.opret_engine(database)
-    try:
-        resultat = faerdselsmoede_pdf.hent_moede(engine, meeting_id)
-    finally:
-        engine.dispose()
-    if resultat is None:
-        raise BusinessError(f"Mødet {meeting_id} findes ikke i databasen ({database}). "
-                            "Er databasekopien ældre end mødet? Kopiér en ny og læg elementet i køen igen.")
-    moede, indstillinger = resultat
-    log(f"Færdselsmøde nr. {moede.meeting_number} hentet med {len(indstillinger)} indstilling(er)")
-
-    # 4. Lav dokumentet: dagsorden = PDF, referat = ZIP med referat + bilag ---
-    if document_type == "dagsorden":
-        indhold, filtype = faerdselsmoede_pdf.build_agenda_pdf(moede, indstillinger), "pdf"
-    else:
-        api_login = orchestrator_connection.get_credential(CRED_FAERDSELSMOEDE_API)
-        api = FaerdselsmoedeApi(api_login.username, api_login.password)
-        api.status()   # forkert nøgle/URL opdages her, før der hentes filer
-        bilag = api.hent_moedets_bilag(meeting_id)
-        antal = sum(len(filer) for filer in bilag.values())
-        log(f"{antal} bilag hentet fra Færdselsmødets API "
-            f"({sum(len(i) for filer in bilag.values() for _, i in filer) / 1024:.0f} KB)")
-        indhold, ukendte = faerdselsmoede_pdf.build_referat_zip(moede, indstillinger, bilag)
-        if ukendte:
-            raise BusinessError(f"Web-appen har bilag til {len(ukendte)} dagsordenspunkt(er), som ikke findes i "
-                                f"robottens database ({database}). Kopiér en ny database og læg elementet i køen igen.")
-        filtype = "zip"
+    # 3. Hent mødet og det færdige dokument fra sitet ---------------------------
+    api = FaerdselsmoedeApi(api_login.username, api_login.password)
+    api.status()   # forkert nøgle/URL opdages her
+    moede = api.moede_info(meeting_id)
+    indhold, filtype = api.hent_dokument(meeting_id, document_type)
+    log(f"{moede['label']}: {document_type} hentet fra sitet ({filtype.upper()}, {len(indhold) / 1024:.0f} KB)")
 
     # Titel som de eksisterende dokumenter i GO: "Færdselsmøde nr. 1302 - referat".
-    # En rettelse (manuel overførsel) bliver et NYT dokument, fordi det første er
-    # journaliseret i GO og ikke skal overskrives.
-    titel = f"Færdselsmøde nr. {moede.meeting_number} - {document_type}"
+    # En rettelse bliver et NYT dokument, fordi det første er journaliseret i GO og
+    # ikke skal overskrives.
+    titel = f"Færdselsmøde nr. {moede['meeting_number']} - {document_type}"
     if payload.get("rettelse"):
         titel += f" (rettet {datetime.now().strftime('%d-%m-%Y %H.%M')})"
-    log(f"{filtype.upper()} lavet: {titel} ({len(indhold) / 1024:.0f} KB)")
 
-    # 5. Overfør til GO og journaliser --------------------------------------
+    # 4. Overfør til GO og journaliser --------------------------------------
     session = requests.Session()
     session.auth = HttpNtlmAuth(go_api_login.username, go_api_login.password)
 
@@ -176,20 +148,6 @@ def _parse_queue_element(queue_element: QueueElement | None) -> dict:
     return payload
 
 
-def _hent_database_constant(orchestrator_connection: OrchestratorConnection) -> str:
-    """Databasen fra Constant; findes den ikke, bruges SQLite-kopien i robottens mappe."""
-    return _hent_constant(orchestrator_connection, CONST_DATABASE, DATABASE_STANDARD)
-
-
-def _hent_constant(orchestrator_connection: OrchestratorConnection, navn: str, standard: str) -> str:
-    """En Constant (uden omkransende anførselstegn); findes den ikke, bruges `standard`."""
-    try:
-        return orchestrator_connection.get_constant(navn).value.strip().strip('"').strip("'")
-    except ValueError:
-        orchestrator_connection.log_info(f"Constant '{navn}' findes ikke - bruger {standard}")
-        return standard
-
-
 # ---------------------------------------------------------------------------
 # GO
 # ---------------------------------------------------------------------------
@@ -214,9 +172,6 @@ def overfoer_til_go(orchestrator_connection: OrchestratorConnection, session: re
     sagsnummer = (go_case_number or GO_SAGSNUMMER_STANDARD).strip().upper()
     filnavn = _sikkert_filnavn(f"{titel}.{filtype}")
 
-    if len(indhold) > GO_MAKS_BYTES:
-        raise BusinessError(f"{filnavn} er {len(indhold) / 1024 / 1024:.1f} MB - over GO's grænse på 10 MB for normal upload.")
-
     ows = {
         "Title": titel,
         "CaseID": sagsnummer,
@@ -225,6 +180,13 @@ def overfoer_til_go(orchestrator_connection: OrchestratorConnection, session: re
     }
     metadata_xml = '<z:row xmlns:z="#RowsetSchema" ' + " ".join(
         f'ows_{k}="{_xml_attr(v)}"' for k, v in ows.items()) + "/>"
+
+    if len(indhold) > GO_MAKS_BYTES:
+        # Over AddToCase-grænsen: chunk-upload via SharePoint (samme metode som Aktbob-robotten)
+        orchestrator_connection.log_info(
+            f"{filnavn} er {len(indhold) / 1024 / 1024:.1f} MB - over 10 MB, bruger chunk-upload til GO-sag {sagsnummer}")
+        return upload_stort_dokument(orchestrator_connection, session, go_api_url, sagsnummer,
+                                     filnavn, indhold, metadata_xml)
 
     payload = {
         "Bytes": list(indhold),
@@ -239,7 +201,7 @@ def overfoer_til_go(orchestrator_connection: OrchestratorConnection, session: re
     url = f"{go_api_url.rstrip('/')}/_goapi/Documents/AddToCase"
 
     orchestrator_connection.log_info(f"Uploader {filnavn} til GO-sag {sagsnummer}")
-    resp = _go_post_med_retries(session, url, sagsnummer, data=payload)
+    resp = _go_post_med_retries(session, url, sagsnummer, json=payload)
     svar = resp.json()
     if "DocId" not in svar:
         raise RuntimeError(f"GO svarede uden DocId for {filnavn}: {str(svar)[:300]}")
@@ -303,3 +265,161 @@ def _xml_attr(vaerdi: str) -> str:
 def _sikkert_filnavn(navn: str) -> str:
     """Fjerner tegn, som Windows/SharePoint ikke tillader i filnavne."""
     return "".join("_" if c in '<>:"/\\|?*#%' else c for c in navn).strip()
+
+
+# ---------------------------------------------------------------------------
+# Stor upload (> 10 MB) - chunk-upload via SharePoint, som i Aktbob-robotten
+# ---------------------------------------------------------------------------
+
+def upload_stort_dokument(orchestrator_connection: OrchestratorConnection, session: requests.Session,
+                          go_api_url: str, sagsnummer: str, filnavn: str, indhold: bytes,
+                          metadata_xml: str) -> int:
+    """Chunk-uploader filen til sagens dokumentbibliotek, finder dens DocId og sætter
+    metadata (titel, dato, korrespondance). Returnerer DocId.
+
+    Bruger en separat session, fordi chunk-upload sætter SharePoint-headere
+    (X-RequestDigest, Accept: odata=verbose), som ikke må følge med til andre GO-kald."""
+    log = orchestrator_connection.log_info
+    sp = requests.Session()
+    sp.auth = session.auth
+    api_url = go_api_url.rstrip("/")
+
+    case_url = _hent_case_url(api_url, sp, sagsnummer)
+    digest = _request_form_digest(api_url, case_url, sp)
+    _chunked_file_upload(api_url, case_url, indhold, filnavn, sp, digest, "", log)
+
+    doc_id = None
+    for forsoeg in range(1, 7):          # SharePoint/GO skal lige registrere filen
+        time.sleep(5)
+        doc_id = _find_docid(filnavn, api_url, case_url, "", sp, log)
+        if doc_id is not None:
+            break
+        log(f"DocId for {filnavn} ikke fundet endnu (forsøg {forsoeg})")
+    if doc_id is None:
+        raise RuntimeError(f"Stor upload af {filnavn} gennemført, men DocId kunne ikke findes på sagen {sagsnummer}.")
+
+    _opdater_metadata(api_url, doc_id, session, metadata_xml)
+    log(f"Stor upload færdig: {filnavn} (DocId {doc_id})")
+    return int(doc_id)
+
+
+def _hent_case_url(api_url: str, session: requests.Session, sagsnummer: str) -> str:
+    """Sagens SharePoint-URL (ows_CaseUrl) fra GO's metadata."""
+    resp = session.get(f"{api_url}/_goapi/Cases/Metadata/{sagsnummer}/False", timeout=120)
+    if 400 <= resp.status_code < 500:
+        raise BusinessError(f"GO kender ikke sagen {sagsnummer} (HTTP {resp.status_code}).")
+    resp.raise_for_status()
+    case_url = ET.fromstring(resp.json()["Metadata"]).attrib.get("ows_CaseUrl")
+    if not case_url:
+        raise RuntimeError(f"GO-sagen {sagsnummer} har ingen CaseUrl i metadata.")
+    return case_url
+
+
+def _request_form_digest(api_url: str, case_url: str, session: requests.Session) -> str:
+    session.headers.update({"Accept": "application/json; odata=verbose"})
+    resp = session.post(f"{api_url}/{case_url}/_api/contextinfo", timeout=120)
+    resp.raise_for_status()
+    return resp.json()["d"]["GetContextWebInformation"]["FormDigestValue"]
+
+
+def _odata_string_literal(value) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _alias_url(base_url: str, aliases: dict) -> str:
+    query = "&".join(f"{name}={quote(_odata_string_literal(value), safe=chr(39) + '/-_.~')}"
+                     for name, value in aliases.items())
+    return f"{base_url}?{query}"
+
+
+def _document_folder_url(case_url: str, folder_path: str | None) -> str:
+    root_folder = f"/{str(case_url).strip('/')}/Dokumenter"
+    normalized = (folder_path or "").replace("\\", "/").strip("/")
+    return f"{root_folder}/{normalized}" if normalized else root_folder
+
+
+def _chunked_file_upload(api_url, case_url, binary: bytes, file_name, session: requests.Session,
+                         request_digest, folder_path, log) -> None:
+    """Opretter filen og uploader den i bidder (startUpload / continueUpload / finishUpload)."""
+    session.headers.update({"X-FORMS_BASED_AUTH_ACCEPTED": "f", "X-RequestDigest": request_digest})
+    web_url = f"{api_url}/{str(case_url).strip('/')}"
+    target_folder_url = _document_folder_url(case_url, folder_path)
+
+    create_url = _alias_url(
+        f"{web_url}/_api/web/GetFolderByServerRelativePath(DecodedUrl=@p)/Files/add(url=@f,overwrite=true)",
+        {"@p": target_folder_url, "@f": file_name})
+    session.post(create_url, timeout=300).raise_for_status()
+
+    target_url = f"{target_folder_url}/{file_name}"
+    upload_id = str(uuid.uuid4())
+    total = len(binary)
+    offset = 0
+
+    def kald(metode: str, data: bytes):
+        url = _alias_url(f"{web_url}/_api/web/GetFileByServerRelativePath(DecodedUrl=@u)/{metode}",
+                         {"@u": target_url})
+        session.post(url, data=data, timeout=900).raise_for_status()
+
+    with io.BytesIO(binary) as stream:
+        first = True
+        while True:
+            buffer = stream.read(CHUNK_BYTES)
+            if not buffer:
+                break
+            if first and len(buffer) == total:          # hele filen i ét stykke
+                kald(f"startUpload(uploadId=guid'{upload_id}')", buffer)
+                kald(f"finishUpload(uploadId=guid'{upload_id}',fileOffset={offset})", buffer)
+                break
+            if first:
+                kald(f"startUpload(uploadId=guid'{upload_id}')", buffer)
+                first = False
+            elif stream.tell() == total:
+                kald(f"finishUpload(uploadId=guid'{upload_id}',fileOffset={offset})", buffer)
+            else:
+                kald(f"continueUpload(uploadId=guid'{upload_id}',fileOffset={offset})", buffer)
+            offset += len(buffer)
+            log(f"Uploadet {offset / 1024 / 1024:.0f} af {total / 1024 / 1024:.0f} MB")
+
+
+def _find_docid(file_name, api_url, case_url, folder_path, session: requests.Session, log):
+    """Finder GO's DocId for filen i sagens dokumentbibliotek (som get_docid i Aktbob)."""
+    resp = session.get(f"{api_url}/{case_url}/_goapi/Administration/GetLeftMenuCounter", timeout=120)
+    resp.raise_for_status()
+    view_id = next((i.get("ViewId") for i in resp.json()
+                    if i.get("ViewName") == "AllItems.aspx" and i.get("ListName") == "Dokumenter"), None)
+    if view_id is None:
+        raise RuntimeError("ViewId for AllItems.aspx blev ikke fundet på sagen.")
+
+    list_url = f"'/{case_url}/Dokumenter'"
+    root_folder = _document_folder_url(case_url, folder_path)
+    url = (f"{api_url}/{case_url}/_api/web/GetList(@listUrl)/RenderListDataAsStream"
+           f"?@listUrl={list_url}&View={view_id}&RootFolder={root_folder}")
+    payload = json.dumps({"parameters": {
+        "__metadata": {"type": "SP.RenderListDataParameters"},
+        "ViewXml": "<View><Query><Where><Eq><FieldRef Name=\"UniqueId\" />"
+                   f"<Value Type=\"Guid\">{uuid.uuid4()}</Value></Eq></Where></Query>"
+                   "<RowLimit Paged=\"TRUE\">100</RowLimit></View>"}})
+    while True:
+        resp = session.post(url, headers={"content-type": "application/json;odata=verbose"},
+                            data=payload, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+        for row in data.get("Row", []):
+            if str(row.get("FileLeafRef")).lower() == str(file_name).lower():
+                return row.get("DocID")
+        next_href = data.get("NextHref")
+        if not next_href:
+            return None
+        url = (f"{api_url}/{case_url}/_api/web/GetList(@listUrl)/RenderListDataAsStream"
+               f"?@listUrl={list_url}{next_href.replace('?', '&', 1)}")
+        log("Henter næste side af dokumentlisten")
+
+
+def _opdater_metadata(api_url: str, doc_id, session: requests.Session, metadata_xml: str) -> None:
+    """Sætter metadata på et chunk-uploadet dokument. Endpointet vil have datoen som
+    mm-dd-åååå, så ows_Dato vendes (som update_metadata i Aktbob-robotten)."""
+    m = re.search(r'ows_Dato="(\d{2})-(\d{2})-(\d{4})"', metadata_xml)
+    if m:
+        metadata_xml = metadata_xml.replace(m.group(0), f'ows_Dato="{m.group(2)}-{m.group(1)}-{m.group(3)}"')
+    _go_post_med_retries(session, f"{api_url}/_goapi/Documents/Metadata", f"metadata for DocId {doc_id}",
+                         data={"DocId": doc_id, "MetadataXml": metadata_xml})

@@ -1,15 +1,16 @@
-"""faerdselsmoede_api.py - henter bilag fra Færdselsmødets web-app via dens fil-API.
+"""faerdselsmoede_api.py - henter de færdige dokumenter fra Færdselsmødets web-app.
 
-Bilagene ligger på web-serverens lokale drev. Robotten kører på en anden server og
-henter dem derfor over HTTP (dokumentation: docs/API.md i web-appen).
+Sitet bygger selv dagsorden (PDF) og referat med bilag (ZIP) - præcis de dokumenter,
+deltagerne fik - og udleverer dem via sit API (dokumentation: docs/API.md i web-appen).
+Robotten skal derfor ikke have adgang til sitets database eller bilagsmappe.
 
 Credential i OpenOrchestrator (CRED_FAERDSELSMOEDE_API i process.py):
-    Username = API'ets base-URL, fx "https://faerdselsmoede.aarhus.dk/api/v1"
+    Username = API'ets base-URL, fx "https://faerdselsmoedet.adm.aarhuskommune.dk/api/v1"
     Password = API-nøglen (samme værdi som FAERDSELSMOEDE_API_KEY på web-serveren)
 
 Fejl:
-    BusinessError  -> mødet/bilaget findes ikke, eller en fil mangler på web-serveren.
-                      Kan ikke lykkes ved at prøve igen.
+    BusinessError  -> mødet findes ikke, eller bilag mangler på web-serveren (409).
+                      Kan ikke lykkes ved at prøve igen, før nogen har rettet det.
     RuntimeError   -> forkert nøgle/URL, API'et slået fra, serveren nede eller en fil
                       kom ikke helt frem. Frameworket prøver igen og sender fejlmail.
 """
@@ -20,12 +21,13 @@ import requests
 
 from robot_framework.exceptions import BusinessError
 
-TIMEOUT_LISTE = (10, 60)    # (forbind, svar) i sekunder
-TIMEOUT_FIL = (10, 300)
+TIMEOUT_KORT = (10, 60)     # (forbind, svar) i sekunder
+TIMEOUT_FIL = (10, 900)     # en referat-ZIP med store bilag kan tage tid at bygge og hente
 FORSOEG = 3
 PAUSE_SEK = 10
 
-_BUSINESS_FEJL = {"moede_findes_ikke", "bilag_findes_ikke", "fil_mangler"}
+_BUSINESS_FEJL = {"moede_findes_ikke", "bilag_mangler", "bilag_findes_ikke", "fil_mangler"}
+_DOKUMENTER = {"dagsorden": "dagsorden.pdf", "referat": "referat.zip"}
 
 
 class FaerdselsmoedeApi:
@@ -41,7 +43,6 @@ class FaerdselsmoedeApi:
         self.base_url = base_url
         self.session = requests.Session()
         self.session.headers["X-API-Key"] = api_noegle
-        self.session.headers["Accept"] = "application/json"
 
     # -- Lavniveau ----------------------------------------------------------
 
@@ -71,6 +72,9 @@ class FaerdselsmoedeApi:
             data = {}
         kode, besked = data.get("fejl", ""), data.get("besked", resp.text[:200])
         if kode in _BUSINESS_FEJL:
+            mangler = data.get("mangler") or []
+            if mangler:
+                besked += " Mangler: " + ", ".join(mangler[:5]) + (" …" if len(mangler) > 5 else "")
             raise BusinessError(f"{hvad}: {besked}")
         if resp.status_code == 401:
             raise RuntimeError("Færdselsmødets API afviste nøglen (401). Tjek at credential'ens Password er "
@@ -81,41 +85,23 @@ class FaerdselsmoedeApi:
 
     def status(self) -> dict:
         """Tjekker forbindelse og nøgle. Kaster RuntimeError, hvis noget er galt."""
-        data = self._get(f"{self.base_url}/status", TIMEOUT_LISTE, "statuskald").json()
-        if not data.get("bilagsmappe_tilgaengelig", True):
-            raise RuntimeError("Web-serverens bilagsmappe (UPLOAD_FOLDER) findes ikke.")
-        return data
+        return self._get(f"{self.base_url}/status", TIMEOUT_KORT, "statuskald").json()
 
-    def bilagsliste(self, meeting_id: str) -> dict:
-        """Mødets bilag pr. dagsordenspunkt (se docs/API.md)."""
-        return self._get(f"{self.base_url}/moeder/{meeting_id}/bilag", TIMEOUT_LISTE,
-                         f"bilagslisten for møde {meeting_id}").json()
+    def moede_info(self, meeting_id: str) -> dict:
+        """Mødets nummer, label, dato og status (se docs/API.md)."""
+        return self._get(f"{self.base_url}/moeder/{meeting_id}", TIMEOUT_KORT,
+                         f"mødet {meeting_id}").json()
 
-    def hent_fil(self, bilag: dict) -> bytes:
-        """Henter én fil og tjekker SHA-256, så en afbrudt overførsel ikke ender i ZIP'en."""
-        hvad = f"bilag {bilag['id']} ({bilag.get('original_filename')})"
+    def hent_dokument(self, meeting_id: str, document_type: str) -> tuple[bytes, str]:
+        """Henter dagsordenen (PDF) eller referatet med bilag (ZIP) fra sitet.
+        Returnerer (indhold, filtype). Tjekker SHA-256, så en afbrudt overførsel opdages."""
+        sti = _DOKUMENTER[document_type]
+        hvad = f"{document_type} for møde {meeting_id}"
         for forsoeg in range(1, FORSOEG + 1):
-            resp = self._get(bilag["download_url"], TIMEOUT_FIL, hvad)
+            resp = self._get(f"{self.base_url}/moeder/{meeting_id}/{sti}", TIMEOUT_FIL, hvad)
             forventet = resp.headers.get("X-Content-SHA256", "").lower()
             if not forventet or hashlib.sha256(resp.content).hexdigest() == forventet:
-                return resp.content
+                return resp.content, sti.rsplit(".", 1)[1]
             if forsoeg < FORSOEG:
                 time.sleep(PAUSE_SEK * forsoeg)
         raise RuntimeError(f"{hvad} kom ikke helt frem (SHA-256 passer ikke) efter {FORSOEG} forsøg.")
-
-    def hent_moedets_bilag(self, meeting_id: str) -> dict[str, list[tuple[str, bytes]]]:
-        """Alle mødets bilag som {proposal_id: [(original_filename, indhold), ...]}.
-
-        Kaster BusinessError, hvis web-serveren mangler en eller flere filer - så lægges
-        der aldrig en ufuldstændig ZIP på GO."""
-        liste = self.bilagsliste(meeting_id)
-        mangler = [f"{p['nummer']}. {p['titel']}/{b['original_filename']}"
-                   for p in liste["dagsordenspunkter"] for b in p["bilag"] if not b["findes"]]
-        if mangler:
-            raise BusinessError(f"{len(mangler)} bilag mangler på web-serveren: "
-                                + ", ".join(mangler[:5]) + (" …" if len(mangler) > 5 else "")
-                                + ". Upload dem igen i web-appen og læg elementet i køen igen.")
-        resultat = {}
-        for punkt in liste["dagsordenspunkter"]:
-            resultat[punkt["proposal_id"]] = [(b["original_filename"], self.hent_fil(b)) for b in punkt["bilag"]]
-        return resultat
